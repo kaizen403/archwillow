@@ -80,6 +80,7 @@ class MicOSD:
         self.update_timer_id = None
         self._auto_hide_timeout_id = None
         self._state_poll_timer_id = None
+        self._recording_status_poll_timer_id = None
         self._last_visualizer_state = None
         self.daemon = daemon
         self.visible = False
@@ -126,6 +127,9 @@ class MicOSD:
             if self._state_poll_timer_id:
                 GLib.source_remove(self._state_poll_timer_id)
                 self._state_poll_timer_id = None
+            if self._recording_status_poll_timer_id:
+                GLib.source_remove(self._recording_status_poll_timer_id)
+                self._recording_status_poll_timer_id = None
             if self._auto_hide_timeout_id:
                 GLib.source_remove(self._auto_hide_timeout_id)
                 self._auto_hide_timeout_id = None
@@ -239,10 +243,14 @@ class MicOSD:
         if not self._state_poll_timer_id:
             self._state_poll_timer_id = GLib.timeout_add(100, self._poll_state_file)
 
-        # Start auto-hide timeout (30 seconds)
+        # Start recording status polling (100ms interval)
+        if not self._recording_status_poll_timer_id:
+            self._recording_status_poll_timer_id = GLib.timeout_add(100, self._poll_recording_status)
+
+        # Start auto-hide timeout (15 seconds)
         if self._auto_hide_timeout_id:
             GLib.source_remove(self._auto_hide_timeout_id)
-        self._auto_hide_timeout_id = GLib.timeout_add_seconds(30, self._auto_hide_callback)
+        self._auto_hide_timeout_id = GLib.timeout_add_seconds(15, self._auto_hide_callback)
     
     def _hide(self):
         """Hide the OSD and stop audio monitoring."""
@@ -268,6 +276,11 @@ class MicOSD:
             if self._state_poll_timer_id:
                 GLib.source_remove(self._state_poll_timer_id)
                 self._state_poll_timer_id = None
+
+            # Stop recording status polling timer
+            if self._recording_status_poll_timer_id:
+                GLib.source_remove(self._recording_status_poll_timer_id)
+                self._recording_status_poll_timer_id = None
 
             # Cancel auto-hide timeout
             if self._auto_hide_timeout_id:
@@ -300,6 +313,12 @@ class MicOSD:
                 except Exception:
                     pass
                 self._state_poll_timer_id = None
+            if self._recording_status_poll_timer_id:
+                try:
+                    GLib.source_remove(self._recording_status_poll_timer_id)
+                except Exception:
+                    pass
+                self._recording_status_poll_timer_id = None
             if self._auto_hide_timeout_id:
                 try:
                     GLib.source_remove(self._auto_hide_timeout_id)
@@ -355,20 +374,52 @@ class MicOSD:
             pass  # Ignore file read errors
         return True  # Continue polling
 
+    def _poll_recording_status(self):
+        """Poll the recording status file and auto-hide if recording is no longer active."""
+        if not self.visible:
+            return False  # Stop polling when not visible
+
+        try:
+            if not RECORDING_STATUS_FILE.exists():
+                # No status file means not recording - hide
+                print("[MIC-OSD] Recording status file missing - auto-hiding", flush=True)
+                self._hide()
+                return False  # Stop polling
+
+            # Check file content and age
+            status = RECORDING_STATUS_FILE.read_text().strip()
+            file_age = time.time() - RECORDING_STATUS_FILE.stat().st_mtime
+
+            if status != 'true' or file_age > 30.0:
+                # Not actively recording or stale status - hide
+                print(f"[MIC-OSD] Recording inactive or stale (status={status}, age={file_age:.1f}s) - auto-hiding", flush=True)
+                self._hide()
+                return False  # Stop polling
+        except Exception:
+            # File read error - assume not recording
+            try:
+                self._hide()
+            except Exception:
+                pass
+            return False
+
+        return True  # Continue polling
+
     def _auto_hide_callback(self):
-        """Auto-hide callback triggered after 30 seconds of visibility."""
+        """Auto-hide callback triggered after 15 seconds of visibility."""
         if not self.visible:
             self._auto_hide_timeout_id = None
             return False  # Don't repeat
         
-        # Check if recording is still active before hiding
+        # Check if recording is still active and fresh before hiding
         # This prevents hiding during normal long recordings
         recording_active = False
         try:
             if RECORDING_STATUS_FILE.exists():
                 with open(RECORDING_STATUS_FILE, 'r') as f:
                     status = f.read().strip()
-                    if status == 'true':
+                    file_age = time.time() - RECORDING_STATUS_FILE.stat().st_mtime
+                    if status == 'true' and file_age < 30.0:
                         recording_active = True
         except Exception:
             # File read error - assume not recording, allow hide
@@ -377,11 +428,11 @@ class MicOSD:
         if recording_active:
             # Recording is still active - reset timeout instead of hiding
             print("[MIC-OSD] Recording active - resetting auto-hide timeout", flush=True)
-            self._auto_hide_timeout_id = GLib.timeout_add_seconds(30, self._auto_hide_callback)
+            self._auto_hide_timeout_id = GLib.timeout_add_seconds(15, self._auto_hide_callback)
             return False  # Don't repeat (new timeout already set)
         else:
-            # Recording not active - window is stuck, hide it
-            print("[MIC-OSD] Auto-hiding window after 30 second timeout (recording not active)", flush=True)
+            # Recording not active or stale - window is stuck, hide it
+            print("[MIC-OSD] Auto-hiding window after timeout (recording not active)", flush=True)
             self._hide()
             self._auto_hide_timeout_id = None
             return False  # Don't repeat
@@ -413,6 +464,10 @@ class MicOSD:
         if self._state_poll_timer_id:
             GLib.source_remove(self._state_poll_timer_id)
             self._state_poll_timer_id = None
+
+        if self._recording_status_poll_timer_id:
+            GLib.source_remove(self._recording_status_poll_timer_id)
+            self._recording_status_poll_timer_id = None
 
         if self._auto_hide_timeout_id:
             GLib.source_remove(self._auto_hide_timeout_id)
