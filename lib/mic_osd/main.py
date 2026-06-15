@@ -10,6 +10,7 @@ Supports two modes:
 import sys
 import signal
 import os
+import time
 import json
 import numpy as np
 from pathlib import Path
@@ -55,16 +56,17 @@ from .theme import ThemeWatcher
 
 # Import paths with fallback for daemon context
 try:
-    from ..src.paths import RECORDING_STATUS_FILE, VISUALIZER_STATE_FILE
+    from ..src.paths import RECORDING_STATUS_FILE, VISUALIZER_STATE_FILE, AUDIO_LEVEL_FILE
 except ImportError:
     try:
-        from src.paths import RECORDING_STATUS_FILE, VISUALIZER_STATE_FILE
+        from src.paths import RECORDING_STATUS_FILE, VISUALIZER_STATE_FILE, AUDIO_LEVEL_FILE
     except ImportError:
         # Fallback: construct paths manually if imports fail
         home = Path.home()
         xdg_config = Path(os.environ.get('XDG_CONFIG_HOME', home / '.config'))
         RECORDING_STATUS_FILE = xdg_config / 'hyprwhspr' / 'recording_status'
         VISUALIZER_STATE_FILE = xdg_config / 'hyprwhspr' / 'visualizer_state'
+        AUDIO_LEVEL_FILE = xdg_config / 'hyprwhspr' / 'audio_level'
 
 
 class MicOSD:
@@ -86,6 +88,15 @@ class MicOSD:
         self.visible = False
         self.theme_watcher = None
         self._should_stop = False
+
+        # Fallback state when audio monitor fails (device conflict)
+        self._audio_monitor_failed = False
+        self._file_based_level = 0.0
+
+        # Grace counter for recording-status poll (avoid premature hide)
+        self._recording_status_missing_count = 0
+
+        print('[MIC-OSD] Daemon initialized', flush=True)
 
         # Get visualization
         viz_class = VISUALIZATIONS.get(visualization, VISUALIZATIONS["waveform"])
@@ -220,20 +231,13 @@ class MicOSD:
         try:
             device_id = _resolve_input_device()
             self.audio_monitor.start(device=device_id)
+            self._audio_monitor_failed = False
+            print(f"[MIC-OSD] Audio monitor started on device {device_id}", flush=True)
         except Exception as e:
-            # Audio monitoring failed (e.g., mic unavailable)
-            # Hide window and reset state to prevent hanging
-            print(f"[MIC-OSD] Failed to start audio monitoring: {e}", flush=True)
-            self.visible = False
-            if self.window:
-                self.window.set_visible(False)
-
-            # Stop update timer if it was started
-            if self.update_timer_id:
-                GLib.source_remove(self.update_timer_id)
-                self.update_timer_id = None
-
-            return  # Exit early - don't start timer
+            # Audio monitoring failed (e.g., device busy). Keep the window open
+            # and fall back to reading the audio level from the main process.
+            print(f"[MIC-OSD] Failed to start audio monitoring: {e} - using file-based level fallback", flush=True)
+            self._audio_monitor_failed = True
 
         # Start update timer immediately for fast opening (60 FPS)
         if not self.update_timer_id:
@@ -291,6 +295,11 @@ class MicOSD:
             if self.audio_monitor:
                 self.audio_monitor.stop()
                 self.audio_monitor = None
+            
+            # Reset fallback state
+            self._audio_monitor_failed = False
+            self._file_based_level = 0.0
+            self._recording_status_missing_count = 0
         except Exception as e:
             # Ensure window is hidden even if exceptions occur
             print(f"[MIC-OSD] Error in _hide(): {e}", flush=True)
@@ -332,25 +341,48 @@ class MicOSD:
                 except Exception:
                     pass
                 self.audio_monitor = None
+            
+            # Reset fallback state
+            self._audio_monitor_failed = False
+            self._file_based_level = 0.0
+            self._recording_status_missing_count = 0
     
     def _update(self):
         """Update visualization with current audio data."""
-        if self.audio_monitor and self.window and self.visible:
+        if not self.window or not self.visible:
+            return True  # Continue timer
+
+        if self.audio_monitor and not self._audio_monitor_failed:
             level = self.audio_monitor.get_level()
             samples = self.audio_monitor.get_samples()
-            self.window.update(level, samples)
-            # Debug level log once per second (~60 frames)
-            if not hasattr(self, '_update_counter'):
-                self._update_counter = 0
-            self._update_counter += 1
-            if self._update_counter % 60 == 0:
-                samples_max = float(np.max(np.abs(samples))) if samples is not None and len(samples) > 0 else 0.0
-                print(f'[MIC-OSD] level={level:.4f} samples_max={samples_max:.4f}', flush=True)
-                try:
-                    with open('/tmp/mic-osd-level.txt', 'w') as f:
-                        f.write(f'{level:.4f} {samples_max:.4f}\n')
-                except Exception:
-                    pass
+        else:
+            # Fallback: read level from main process's audio_level file
+            try:
+                if AUDIO_LEVEL_FILE.exists():
+                    level = float(AUDIO_LEVEL_FILE.read_text().strip())
+                else:
+                    level = 0.0
+            except Exception:
+                level = 0.0
+            self._file_based_level = level
+            # Generate synthetic waveform samples from the level
+            t = np.linspace(0, 2 * np.pi * 4, 1024)
+            samples = level * np.sin(t) * 0.5 + (np.random.random(1024) - 0.5) * 0.1 * level
+
+        self.window.update(level, samples)
+
+        # Debug level log once per second (~60 frames)
+        if not hasattr(self, '_update_counter'):
+            self._update_counter = 0
+        self._update_counter += 1
+        if self._update_counter % 60 == 0:
+            samples_max = float(np.max(np.abs(samples))) if samples is not None and len(samples) > 0 else 0.0
+            print(f'[MIC-OSD] level={level:.4f} samples_max={samples_max:.4f} fallback={self._audio_monitor_failed}', flush=True)
+            try:
+                with open('/tmp/mic-osd-level.txt', 'w') as f:
+                    f.write(f'{level:.4f} {samples_max:.4f}\n')
+            except Exception:
+                pass
         return True  # Continue timer
 
     def _poll_state_file(self):
@@ -380,28 +412,34 @@ class MicOSD:
             return False  # Stop polling when not visible
 
         try:
+            missing_or_stale = False
             if not RECORDING_STATUS_FILE.exists():
-                # No status file means not recording - hide
-                print("[MIC-OSD] Recording status file missing - auto-hiding", flush=True)
-                self._hide()
-                return False  # Stop polling
+                missing_or_stale = True
+            else:
+                status = RECORDING_STATUS_FILE.read_text().strip()
+                file_age = time.time() - RECORDING_STATUS_FILE.stat().st_mtime
+                if status != 'true' or file_age > 60.0:
+                    missing_or_stale = True
 
-            # Check file content and age
-            status = RECORDING_STATUS_FILE.read_text().strip()
-            file_age = time.time() - RECORDING_STATUS_FILE.stat().st_mtime
+            if missing_or_stale:
+                self._recording_status_missing_count += 1
+            else:
+                self._recording_status_missing_count = 0
 
-            if status != 'true' or file_age > 30.0:
-                # Not actively recording or stale status - hide
-                print(f"[MIC-OSD] Recording inactive or stale (status={status}, age={file_age:.1f}s) - auto-hiding", flush=True)
+            # Only hide after 2 seconds of consecutive missing/stale checks
+            if self._recording_status_missing_count >= 20:
+                print("[MIC-OSD] Recording status missing/stale for 2s - auto-hiding", flush=True)
                 self._hide()
                 return False  # Stop polling
         except Exception:
-            # File read error - assume not recording
-            try:
-                self._hide()
-            except Exception:
-                pass
-            return False
+            # File read error - increment counter but don't hide immediately
+            self._recording_status_missing_count += 1
+            if self._recording_status_missing_count >= 20:
+                try:
+                    self._hide()
+                except Exception:
+                    pass
+                return False
 
         return True  # Continue polling
 
@@ -419,7 +457,7 @@ class MicOSD:
                 with open(RECORDING_STATUS_FILE, 'r') as f:
                     status = f.read().strip()
                     file_age = time.time() - RECORDING_STATUS_FILE.stat().st_mtime
-                    if status == 'true' and file_age < 30.0:
+                    if status == 'true' and file_age < 60.0:
                         recording_active = True
         except Exception:
             # File read error - assume not recording, allow hide
@@ -512,6 +550,12 @@ def _sigusr2_handler(signum, frame):
 def main():
     """Entry point."""
     global _app
+    
+    # Ensure stdout is line-buffered so logs are captured even when not a TTY
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
     
     import argparse
     parser = argparse.ArgumentParser(
