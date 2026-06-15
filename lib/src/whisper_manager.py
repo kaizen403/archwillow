@@ -1061,15 +1061,25 @@ class WhisperManager:
         backend = normalize_backend(backend)
         
         if backend == 'realtime-ws' and self._realtime_client:
-            # Ensure the WebSocket is connected before starting to stream.
-            # ElevenLabs closes idle sessions, so reconnect on demand if needed.
+            # Ensure the WebSocket is connected. ElevenLabs closes idle sessions,
+            # so reconnect on demand. We reconnect in the background so audio
+            # capture can start immediately; audio is buffered until the connection
+            # is ready.
             if not self._realtime_client.connected:
                 provider_id = self.config.get_setting('websocket_provider')
                 if provider_id == 'elevenlabs' and hasattr(self._realtime_client, 'reconnect'):
-                    print('[REALTIME] Client not connected, reconnecting to ElevenLabs...', flush=True)
-                    if not self._realtime_client.reconnect():
-                        print('[REALTIME] Reconnect failed', flush=True)
-                        return None
+                    print('[REALTIME] Client not connected, reconnecting in background...', flush=True)
+
+                    def background_reconnect():
+                        try:
+                            if self._realtime_client.reconnect():
+                                print('[REALTIME] Background reconnect succeeded', flush=True)
+                            else:
+                                print('[REALTIME] Background reconnect failed', flush=True)
+                        except Exception as e:
+                            print(f'[REALTIME] Background reconnect error: {e}', flush=True)
+
+                    threading.Thread(target=background_reconnect, daemon=True).start()
                 else:
                     print('[REALTIME] Client not connected', flush=True)
                     return None
