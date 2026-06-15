@@ -985,6 +985,12 @@ class hyprwhsprApp:
             # Write recording status to file for tray script
             self._write_recording_status(True)
 
+            # Show the mic OSD immediately so the user sees feedback
+            self._show_mic_osd()
+
+            # Start audio level monitoring so the tray sees recording state
+            self._start_audio_level_monitoring()
+
             # Duck system audio if enabled
             if self.config.get_setting('audio_ducking', False):
                 self.audio_ducker.duck()
@@ -1000,16 +1006,15 @@ class hyprwhsprApp:
             
             # Helper function to verify stream is working and play sound
             def verify_and_play_sound():
-                """Wait for callbacks and play sound if stream works"""
+                """Wait for callbacks to confirm stream is working"""
                 import time
                 start_time = time.monotonic()
-                while time.monotonic() - start_time < 1.5:  # Wait up to 1.5s
+                while time.monotonic() - start_time < 3.0:  # Wait up to 3.0s
                     # Read frames_since_start with lock held to avoid data race
                     with self.audio_capture.lock:
                         frames_count = self.audio_capture.frames_since_start
                     if frames_count > 0:
                         # At least one callback received - stream is working
-                        self.audio_manager.play_start_sound()
                         return True
                     time.sleep(0.05)
                 # No callbacks received - stream likely broken (will be handled by caller)
@@ -1062,8 +1067,11 @@ class hyprwhsprApp:
                         self.audio_ducker.restore()
                     return  # Don't attempt recovery during user-initiated recording
                 
-                # Stream is verified working - show mic-osd visualization
-                self._show_mic_osd()
+                # Stream is working - play start sound
+                try:
+                    self.audio_manager.play_start_sound()
+                except Exception as e:
+                    print(f"[WARN] Failed to play start sound: {e}", flush=True)
                 
                 # Additional stability check - verify stream continues working
                 if not verify_stream_stable():
@@ -1097,9 +1105,6 @@ class hyprwhsprApp:
                 if self._background_recovery_needed.is_set():
                     print("[HEALTH] Recording succeeded - canceling background recovery", flush=True)
                     self._background_recovery_needed.clear()
-                
-                # Stream is working and stable - start monitoring
-                self._start_audio_level_monitoring()
                     
             except (RuntimeError, Exception) as e:
                 print(f"[ERROR] Failed to start recording: {e}", flush=True)
