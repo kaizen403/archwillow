@@ -1535,6 +1535,18 @@ class hyprwhsprApp:
                                     return
                             else:
                                 zero_samples = 0
+
+                        # Touch recording status file every 5s to keep it fresh for OSD/tray staleness checks
+                        if not hasattr(self, '_last_recording_status_touch'):
+                            self._last_recording_status_touch = 0.0
+                        now = time.monotonic()
+                        if now - self._last_recording_status_touch > 5.0:
+                            self._last_recording_status_touch = now
+                            try:
+                                if RECORDING_STATUS_FILE.exists():
+                                    RECORDING_STATUS_FILE.touch()
+                            except Exception:
+                                pass
                     except Exception as e:
                         # Silently fail - don't spam errors
                         pass
