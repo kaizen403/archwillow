@@ -211,7 +211,7 @@ class MicOSD:
 
         # Start audio monitoring
         if not self.audio_monitor:
-            self.audio_monitor = AudioMonitor(samplerate=44100, blocksize=1024)
+            self.audio_monitor = AudioMonitor(samplerate=16000, blocksize=1024)
 
         try:
             device_id = _resolve_input_device()
