@@ -88,6 +88,9 @@ class ElevenLabsRealtimeClient:
         # Audio sampling
         self.sample_rate = 16000
 
+        # Pre-connection audio buffer (audio captured before WebSocket is ready)
+        self._audio_buffer: List[bytes] = []
+
     # ------------------------------------------------------------------
     # Connection
     # ------------------------------------------------------------------
@@ -254,14 +257,29 @@ class ElevenLabsRealtimeClient:
 
     def append_audio(self, audio_chunk: np.ndarray):
         """Stream one audio chunk to ElevenLabs. Audio must be 16kHz float32 mono."""
-        if not self.connected or not self.ws:
-            return
-
         try:
             pcm_bytes = self._float32_to_pcm16(audio_chunk)
-            self._send_input_audio_chunk(pcm_bytes, commit=False)
         except Exception as e:
-            print(f'[ELEVENLABS REALTIME] Failed to append audio: {e}', flush=True)
+            print(f'[ELEVENLABS REALTIME] Failed to convert audio: {e}', flush=True)
+            return
+
+        with self.lock:
+            if not self.connected or not self.ws:
+                # Buffer audio while not connected (e.g., during background reconnect)
+                self._audio_buffer.append(pcm_bytes)
+                # Limit buffer to ~6.4s of audio (100 chunks of 1024 samples at 16kHz)
+                while len(self._audio_buffer) > 100:
+                    self._audio_buffer.pop(0)
+                return
+
+            # Connected: flush any buffered audio, then send current
+            buffered = self._audio_buffer.copy()
+            self._audio_buffer.clear()
+
+        for buffered_pcm in buffered:
+            self._send_input_audio_chunk(buffered_pcm, commit=False)
+
+        self._send_input_audio_chunk(pcm_bytes, commit=False)
 
     def _send_input_audio_chunk(self, pcm_bytes: bytes, commit: bool = False):
         if not self.connected or not self.ws:
@@ -293,6 +311,7 @@ class ElevenLabsRealtimeClient:
             self.current_response_text = ''
             self.response_complete = False
             self.response_event.clear()
+            self._audio_buffer.clear()
         print('[ELEVENLABS REALTIME] Buffer cleared', flush=True)
 
     # ------------------------------------------------------------------
@@ -303,6 +322,14 @@ class ElevenLabsRealtimeClient:
         if not self.connected or not self.ws:
             print('[ELEVENLABS REALTIME] Not connected, cannot commit', flush=True)
             return ''
+
+        # Flush any pre-connection buffered audio before sending final commit
+        with self.lock:
+            buffered = self._audio_buffer.copy()
+            self._audio_buffer.clear()
+
+        for buffered_pcm in buffered:
+            self._send_input_audio_chunk(buffered_pcm, commit=False)
 
         try:
             # Reset event state before forcing the final commit
