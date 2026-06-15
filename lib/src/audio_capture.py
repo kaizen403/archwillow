@@ -372,6 +372,13 @@ class AudioCapture:
                 self._cleanup_stream()
             except Exception:
                 pass  # Ignore cleanup errors
+
+            # If stream reference is still stuck, force PortAudio reset
+            if self.stream is not None:
+                print("[RECOVERY] Stuck stream after cleanup, resetting PortAudio state", flush=True)
+                self._reset_portaudio_state()
+                with self.lock:
+                    self.stream = None
         
         try:
             # Clear previous audio data
@@ -415,7 +422,7 @@ class AudioCapture:
         
         # Wait for recording thread to finish (it handles cleanup in finally block)
         if self.record_thread and self.record_thread.is_alive():
-            self.record_thread.join(timeout=3.0)  # Increased from 2.0s to 3.0s
+            self.record_thread.join(timeout=5.0)  # Give stuck PortAudio cleanup time
 
             # Check if thread actually exited
             if self.record_thread.is_alive():
@@ -561,6 +568,8 @@ class AudioCapture:
                 if status:
                     print(f"[WARN] Audio callback status: {status}")
                 
+                audio_chunk = None
+                streaming_cb = None
                 with self.lock:
                     # Update callback health tracking (for recovery success criteria)
                     self.last_callback_monotonic = time.monotonic()
@@ -568,22 +577,25 @@ class AudioCapture:
                     
                     if self.is_recording:
                         # Store the audio data (indata is already numpy array)
-                        audio_chunk = indata[:, 0]  # Get mono channel
+                        audio_chunk = indata[:, 0].copy()  # Get mono channel
                         
                         # Update current audio level for monitoring
                         self.current_level = np.sqrt(np.mean(audio_chunk**2))
                         
                         # Store audio data
-                        self.audio_data.append(audio_chunk.copy())
+                        self.audio_data.append(audio_chunk)
                         
-                        # Call streaming callback if set (for realtime backends)
-                        if self.streaming_callback:
-                            try:
-                                self.streaming_callback(audio_chunk.copy())
-                            except Exception as e:
-                                print(f"[WARN] Streaming callback error: {e}")
+                        # Capture streaming callback reference to call outside lock
+                        streaming_cb = self.streaming_callback
                         
                         chunk_count += 1
+                
+                # Call streaming callback outside lock to avoid blocking capture thread
+                if streaming_cb and audio_chunk is not None:
+                    try:
+                        streaming_cb(audio_chunk)
+                    except Exception as e:
+                        print(f"[WARN] Streaming callback error: {e}")
             
             # Determine device to use for recording (use validated device_id)
             device_to_use = self.device_id
@@ -753,21 +765,42 @@ class AudioCapture:
     def _cleanup_stream(self):
         """Clean up the audio stream (idempotent - safe to call multiple times)"""
         stream = None
-        with self.lock:
-            stream = self.stream
-            if stream is not None:
+        acquired = self.lock.acquire(timeout=0.5)
+        if acquired:
+            try:
+                stream = self.stream
                 self.stream = None  # Clear reference immediately to prevent double cleanup
+            finally:
+                self.lock.release()
+        else:
+            print("[WARN] Could not acquire lock for stream cleanup; will reset PortAudio", flush=True)
+            return
         
-        # Clean up stream outside lock to avoid deadlocks
+        # Clean up stream outside lock with timeout protection
         if stream is not None:
-            try:
-                stream.stop()
-            except (AttributeError, RuntimeError, Exception):
-                pass  # Stream might already be stopped or invalid
-            try:
-                stream.close()
-            except (AttributeError, RuntimeError, Exception):
-                pass  # Stream might already be closed or invalid
+            def _stop_stream():
+                try:
+                    stream.stop()
+                except Exception:
+                    pass
+            
+            def _close_stream():
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            
+            stop_thread = threading.Thread(target=_stop_stream, daemon=True)
+            stop_thread.start()
+            stop_thread.join(timeout=1.0)
+            if stop_thread.is_alive():
+                print("[RECOVERY] stream.stop() timed out during cleanup", flush=True)
+            
+            close_thread = threading.Thread(target=_close_stream, daemon=True)
+            close_thread.start()
+            close_thread.join(timeout=1.0)
+            if close_thread.is_alive():
+                print("[RECOVERY] stream.close() timed out during cleanup", flush=True)
     
     def is_recovery_successful(self) -> bool:
         """
