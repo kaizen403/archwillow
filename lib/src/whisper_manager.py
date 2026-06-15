@@ -246,25 +246,23 @@ class WhisperManager:
                     buffer_max = self.config.get_setting('realtime_buffer_max_seconds', 5)
                     self._realtime_client.set_max_buffer_seconds(buffer_max)
                 
-                # Connect
+                # Try to connect at startup, but don't fail if network isn't ready yet.
+                # The connection will be retried on-demand when recording starts.
                 if provider_id == 'elevenlabs':
-                    if not self._realtime_client.connect(websocket_url, api_key, model_id):
-                        print('ERROR: Failed to connect to ElevenLabs Realtime WebSocket')
-                        try:
-                            self._realtime_client.close()
-                        except Exception:
-                            pass
-                        self._realtime_client = None
-                        return False
+                    startup_connect_ok = self._realtime_client.connect(websocket_url, api_key, model_id)
                 else:
-                    if not self._realtime_client.connect(websocket_url, api_key, model_id, instructions):
-                        print('ERROR: Failed to connect to Realtime WebSocket')
-                        try:
-                            self._realtime_client.close()
-                        except Exception:
-                            pass
-                        self._realtime_client = None
-                        return False
+                    startup_connect_ok = self._realtime_client.connect(websocket_url, api_key, model_id, instructions)
+
+                if not startup_connect_ok:
+                    print(f'[WARN] Failed to connect to {provider_id} Realtime WebSocket at startup; will retry on demand', flush=True)
+                    try:
+                        self._realtime_client.close()
+                    except Exception:
+                        pass
+                    if hasattr(self._realtime_client, 'connected'):
+                        self._realtime_client.connected = False
+                    if hasattr(self._realtime_client, 'session_started'):
+                        self._realtime_client.session_started = False
                 
                 # Set up streaming callback
                 if provider_id == 'elevenlabs':

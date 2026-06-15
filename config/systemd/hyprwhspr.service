@@ -1,11 +1,11 @@
 [Unit]
 Description=hyprwhspr stt
-Documentation=https://github.com/goodroot/hyprwhspr
-After=graphical-session.target pipewire.service ydotool.service
+Documentation=https://github.com/kaizen403/archwillow
+After=graphical-session.target pipewire.service ydotool.service network-online.target
 StartLimitIntervalSec=300
 StartLimitBurst=5
 Requires=ydotool.service
-Wants=pipewire.service
+Wants=pipewire.service network-online.target
 
 [Service]
 Type=simple
