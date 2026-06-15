@@ -255,6 +255,14 @@ class MicOSD:
         if self._auto_hide_timeout_id:
             GLib.source_remove(self._auto_hide_timeout_id)
         self._auto_hide_timeout_id = GLib.timeout_add_seconds(15, self._auto_hide_callback)
+
+        # Always reset the visualizer to recording state when shown so the timer
+        # and any per-recording animation state starts fresh
+        if self.visualization and hasattr(self.visualization, 'set_state'):
+            try:
+                self.visualization.set_state('recording')
+            except Exception:
+                pass
     
     def _hide(self):
         """Hide the OSD and stop audio monitoring."""
@@ -377,10 +385,11 @@ class MicOSD:
         self._update_counter += 1
         if self._update_counter % 60 == 0:
             samples_max = float(np.max(np.abs(samples))) if samples is not None and len(samples) > 0 else 0.0
-            print(f'[MIC-OSD] level={level:.4f} samples_max={samples_max:.4f} fallback={self._audio_monitor_failed}', flush=True)
+            bars_max = float(np.max(self.visualization.bar_heights)) if hasattr(self.visualization, 'bar_heights') else -1.0
+            print(f'[MIC-OSD] level={level:.4f} samples_max={samples_max:.4f} bars_max={bars_max:.4f} fallback={self._audio_monitor_failed}', flush=True)
             try:
                 with open('/tmp/mic-osd-level.txt', 'w') as f:
-                    f.write(f'{level:.4f} {samples_max:.4f}\n')
+                    f.write(f'{level:.4f} {samples_max:.4f} {bars_max:.4f}\n')
             except Exception:
                 pass
         return True  # Continue timer

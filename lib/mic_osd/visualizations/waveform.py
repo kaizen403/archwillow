@@ -29,13 +29,10 @@ class WaveformVisualization(BaseVisualization):
         self.bar_gap = 2
         self.min_bar_height = 1
 
-        # Amplification for more visible response
-        self.amplification = 8.0
-
         # Smoothing for bar heights (makes animation smoother)
         self.bar_heights = np.zeros(self.num_bars)
-        self.decay_rate = 0.75  # How fast bars fall
-        self.rise_rate = 0.7    # How fast bars rise
+        self.decay_rate = 0.85  # How fast bars fall
+        self.rise_rate = 0.85    # How fast bars rise
 
         # State manager for visualizer states (recording, paused, processing, etc.)
         self.state_manager = StateManager()
@@ -50,35 +47,47 @@ class WaveformVisualization(BaseVisualization):
         super().update(level, samples)
 
         if samples is not None and len(samples) > 0:
-            # Calculate bar heights from audio samples
-            # Divide samples into chunks for each bar
-            chunk_size = len(samples) // self.num_bars
-            if chunk_size > 0:
-                new_heights = np.zeros(self.num_bars)
-                for i in range(self.num_bars):
-                    start = i * chunk_size
-                    end = start + chunk_size
-                    chunk = samples[start:end]
-                    # Use RMS of chunk for smoother visualization
-                    rms = np.sqrt(np.mean(chunk ** 2))
-                    new_heights[i] = min(1.0, rms * self.amplification)
-                # Boost with overall level so quiet voices still show movement
-                if level > 0.01 and np.max(new_heights) < level:
-                    new_heights = np.maximum(new_heights, level * 0.8)
+            n = len(samples)
+            # Use FFT to get frequency bands; different bars move with different
+            # frequencies so speech looks dynamic even when the overall level is
+            # relatively steady.
+            window = np.hanning(n)
+            fft = np.fft.rfft(samples * window)
+            magnitude = np.abs(fft)
+            # Normalize so a full-scale sine wave gives a peak magnitude of ~1.0
+            magnitude = magnitude / (n / 2.0)
+            num_bins = len(magnitude)
 
-                # Smooth transitions - rise fast, fall slow
-                for i in range(self.num_bars):
-                    if new_heights[i] > self.bar_heights[i]:
-                        # Rising - quick response
-                        self.bar_heights[i] = (
-                            self.rise_rate * new_heights[i] +
-                            (1 - self.rise_rate) * self.bar_heights[i]
-                        )
-                    else:
-                        # Falling - slow decay
-                        self.bar_heights[i] *= self.decay_rate
-                        if self.bar_heights[i] < new_heights[i]:
-                            self.bar_heights[i] = new_heights[i]
+            new_heights = np.zeros(self.num_bars)
+            for i in range(self.num_bars):
+                start = int(i * num_bins / self.num_bars)
+                end = int((i + 1) * num_bins / self.num_bars)
+                band = magnitude[start:end]
+                if len(band) > 0:
+                    # Use the strongest frequency in the band
+                    band_peak = np.max(band)
+                    # dB scale: -60 dB -> 0, 0 dB -> 1
+                    db = 20.0 * math.log10(band_peak + 1e-6)
+                    normalized = (db + 60.0) / 60.0
+                    new_heights[i] = max(0.0, min(1.0, normalized))
+
+            # Boost with overall level so quiet voices still show movement
+            if level > 0.01:
+                new_heights = np.maximum(new_heights, level * 0.8)
+
+            # Smooth transitions - rise fast, fall slow
+            for i in range(self.num_bars):
+                if new_heights[i] > self.bar_heights[i]:
+                    # Rising - quick response
+                    self.bar_heights[i] = (
+                        self.rise_rate * new_heights[i] +
+                        (1 - self.rise_rate) * self.bar_heights[i]
+                    )
+                else:
+                    # Falling - slow decay
+                    self.bar_heights[i] *= self.decay_rate
+                    if self.bar_heights[i] < new_heights[i]:
+                        self.bar_heights[i] = new_heights[i]
         else:
             # No audio - decay all bars
             self.bar_heights *= self.decay_rate
@@ -178,6 +187,8 @@ class WaveformVisualization(BaseVisualization):
 
     def set_state(self, state_str: str):
         """Set the visualizer state from a string value."""
+        # Always reset the state manager so the state-change time is fresh even
+        # when the file state repeats (e.g., a new recording while already recording)
         self.state_manager.set_state_from_string(state_str)
 
         # Start/stop elapsed time tracking based on state
@@ -186,6 +197,8 @@ class WaveformVisualization(BaseVisualization):
             self._recording_start_time = time.time()
             self._elapsed_seconds = 0.0
             self._show_elapsed_time = True
+            # Reset bar heights so the animation starts from zero for each recording
+            self.bar_heights.fill(0.0)
         elif state_str == 'paused':
             # Keep showing elapsed time but don't increment
             if self._recording_start_time is not None:
